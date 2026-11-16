@@ -28,10 +28,23 @@ from realtime_gui_zh_logic import (
     select_device_kind,
     settings_from_values,
     stop_audio_stream,
+    update_vad_playback,
     validate_extra_context,
     validate_reference_path,
+    wav2vec2_frame_count,
+    wav2vec2_right_pad,
     with_sr_flags,
 )
+
+def _play_vad(values):
+    detected = False
+    hold = 0
+    heard = []
+    for value in values:
+        audible, detected, hold = update_vad_playback(value, detected, hold)
+        heard.append(audible)
+    return heard
+
 
 # Values the Mac window was already using. Kept here so a save cannot drop them.
 USER_CONFIG = {
@@ -176,9 +189,7 @@ class LogicTests(unittest.TestCase):
         self.assertEqual(decide_event("toggle_performance", True), "ui")
         self.assertEqual(decide_event("reload_devices", True), "reload")
         self.assertEqual(decide_event("sg_hostapi", True), "reload")
-        # A timeout read is intentionally not used. If one appeared, the
-        # original catch-all would stop the stream.
-        self.assertEqual(decide_event("__TIMEOUT__", True), "stop")
+        self.assertEqual(decide_event("__TIMEOUT__", True), "tick")
 
     def test_delay_formula_is_estimate_not_a_new_measurement(self):
         self.assertEqual(algorithm_delay_ms(0.08, 0.30, 0.04, 0.02), 450)
@@ -218,6 +229,54 @@ class LogicTests(unittest.TestCase):
         self.assertEqual(select_device_kind(True, True), "cuda")
         self.assertEqual(select_device_kind(False, False), "cpu")
 
+    def test_open_vad_segment_does_not_fade_the_tail_out(self):
+        # 23:43 log shape. len([[550, -1]]) == 1, same as an end event.
+        # The old parity toggle mutes the chunk after the second open result.
+        heard = _play_vad([([550, -1]), [], [[550, -1]], []])
+        self.assertEqual(heard, [True, True, True, True])
+
+    def test_empty_vad_keeps_speech_and_a_real_end_keeps_one_more_block(self):
+        heard = _play_vad([([100, -1]), [], [[-1, 900]], [], []])
+        self.assertEqual(heard, [True, True, True, True, False])
+        heard = _play_vad([[], [], [[100, 400]], [], []])
+        self.assertEqual(heard, [False, False, True, True, False])
+
+    def test_right_context_frame_is_restored_for_the_22050_block(self):
+        # User config at model rate: block 0.30, crossfade 0.04, extra right 0.02, extra ce 2.5.
+        sr = 22050
+        zc = sr // 50
+        block = int(round(0.30 * sr / zc)) * zc
+        cross = int(round(0.04 * sr / zc)) * zc
+        right = int(round(0.02 * sr / zc)) * zc
+        extra = int(round(2.5 * sr / zc)) * zc
+        samples = extra + cross + zc + block + right
+        self.assertEqual(block, 6615)
+        frames_16k = 320 * samples // zc
+        self.assertEqual(frames_16k, 46080)
+        self.assertEqual(wav2vec2_frame_count(frames_16k), frames_16k // 320 - 1)
+        pad = wav2vec2_right_pad(frames_16k)
+        self.assertEqual(pad, 80)
+        self.assertEqual(wav2vec2_frame_count(frames_16k + pad), frames_16k // 320)
+
+    def test_zero_sola_offset_hands_the_tail_to_the_next_block(self):
+        # (6615, 1) in the 23:43 log. sola search is one 20ms frame (441).
+        block = 6615
+        sola = 882
+        origin = 55125
+
+        def span(stream_origin, offset):
+            play_start = stream_origin + offset
+            play_end = play_start + block
+            return play_start, play_end, play_end, play_end + sola
+
+        play_start, play_end, saved_start, _saved_end = span(origin, 0)
+        next_play, _next_end, _next_saved, _ = span(origin + block, 0)
+        self.assertEqual(next_play, saved_start)
+        self.assertEqual(play_end - play_start, block)
+        _start_hi, end_hi, saved_hi, _ = span(origin, 438)
+        self.assertEqual(saved_hi, end_hi)
+        self.assertLessEqual(438, 441)
+
     def test_browse_folder_prefers_existing_reference_dir(self):
         with tempfile.TemporaryDirectory() as tmp:
             ref_dir = os.path.join(tmp, "voice-clone-output")
@@ -243,6 +302,11 @@ class LogicTests(unittest.TestCase):
             self.assertIn(flag, gui)
         self.assertIn("engine.custom_infer", gui)
         self.assertLess(gui.index("self.stop_stream()"), gui.index("sd._terminate()"))
+        self.assertIn("update_vad_playback", gui)
+        self.assertIn("wav2vec2_right_pad", gui)
+        self.assertEqual(gui.count('self.window["infer_time"].update'), 1)
+        self.assertIn("len(res_value) % 2 == 1", engine)
+        self.assertNotIn("update_vad_playback", engine)
         # Model modules are not edited by this window.
         self.assertNotIn("real-time-gui-zh", engine)
 
@@ -300,7 +364,7 @@ class LayoutTests(unittest.TestCase):
         }
         self.assertTrue(required <= keys, sorted(required - keys))
         window = module.sg.Window(
-            "Seed-VC 实时变声",
+            f"Seed-VC 实时变声 {module.GUI_VERSION}",
             layout,
             finalize=True,
             resizable=True,
@@ -310,6 +374,7 @@ class LayoutTests(unittest.TestCase):
         try:
             window["status_detail"].update("模型已加载。请确认麦克风、播放设备和参考声音，然后开始变声。")
             window.refresh()
+            self.assertIn("1.1", window["app_title"].Widget.cget("text"))
             self.assertEqual(window["start_vc"].Widget.cget("text"), "开始变声")
             self.assertEqual(window["stop_vc"].Widget.cget("text"), "停止变声")
             self.assertEqual(window["reference_audio_path"].get(), USER_CONFIG["reference_audio_path"])

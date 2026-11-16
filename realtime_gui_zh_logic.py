@@ -191,10 +191,13 @@ def decide_event(event, running):
     'stop' is the original catch-all: anything that is not a hot update and
     not the start button stops the stream. Fold/expand buttons are 'ui' so
     they do not stop audio. 'reload' tells the window to close the stream
-    before rebuilding the PortAudio device list.
+    before rebuilding the PortAudio device list. '__TIMEOUT__' only refreshes
+    the timing labels; it must not stop the stream.
     """
     if event is None:
         return "close"
+    if event == "__TIMEOUT__":
+        return "tick"
     if event in UI_EVENTS:
         return "ui"
     if event in RELOAD_EVENTS:
@@ -206,6 +209,90 @@ def decide_event(event, running):
     if event == "stop_vc" or event != "start_vc":
         return "stop"
     return "ignore"
+
+
+# Blocks to keep synthesizing after FunASR reports a finished segment.
+# Mute replaces the whole next waveform with zeros, and the 40ms crossfade
+# then fades the saved tail into that silence. One more block lets a release
+# that crossed the chunk boundary play before the fade.
+TAIL_HOLD_BLOCKS = 1
+
+# facebook/wav2vec2-xls-r-300m feature CNN. Valid convolutions, no pad.
+_WAV2VEC2_CONV = (
+    (10, 5),
+    (3, 2),
+    (3, 2),
+    (3, 2),
+    (3, 2),
+    (2, 2),
+    (2, 2),
+)
+
+
+def wav2vec2_frame_count(num_samples):
+    """Frames emitted by the wav2vec2 feature CNN for a 16 kHz waveform."""
+    length = int(num_samples)
+    for kernel, stride in _WAV2VEC2_CONV:
+        if length < kernel:
+            return 0
+        length = (length - kernel) // stride + 1
+    return length
+
+
+def wav2vec2_right_pad(num_samples):
+    """Trailing zeros so the CNN covers floor(num_samples / 320) frames.
+
+    A 16 kHz buffer built as an exact multiple of 320 loses its last 20ms
+    frame. With the current block math that frame is extra_time_right.
+    """
+    target = int(num_samples) // 320
+    if target <= 0:
+        return 0
+    pad = 0
+    while wav2vec2_frame_count(num_samples + pad) < target and pad < 320:
+        pad += 1
+    return pad
+
+
+def _vad_segments(res_value):
+    """Normalize one FunASR streaming `value` into [beg_ms, end_ms] pairs.
+
+    Documented streaming shapes are [[beg, -1]] (open), [[-1, end]] (end),
+    [[beg, end]] (both in this chunk), and [] (no event). end < 0 means the
+    segment is still open. The 23:43 log prints [[550, -1]].
+    """
+    if not res_value:
+        return []
+    first = res_value[0]
+    if isinstance(first, (list, tuple)):
+        return [list(seg) for seg in res_value if isinstance(seg, (list, tuple)) and len(seg) >= 2]
+    if all(isinstance(item, (int, float)) for item in res_value):
+        if len(res_value) % 2 == 1:
+            return [[res_value[0], -1]]
+        if len(res_value) >= 2:
+            return [[res_value[-2], res_value[-1]]]
+    return []
+
+
+def update_vad_playback(res_value, detected, hold, tail_hold=TAIL_HOLD_BLOCKS):
+    """Return (audible, detected_after, hold_after).
+
+    [] does not mean this chunk is silence. A second [[beg, -1]] must not
+    close the gate: len(value) is 1 for an open segment, an end, and a
+    complete segment, so a parity toggle fades the following tail to silence.
+    A finished segment (end >= 0) still plays this chunk, then `tail_hold`
+    more chunks, then mutes.
+    """
+    segments = _vad_segments(res_value)
+    if not segments:
+        if detected:
+            return True, True, hold
+        if hold > 0:
+            return True, False, hold - 1
+        return False, False, 0
+    if any(seg[1] < 0 for seg in segments):
+        return True, True, 0
+    return True, False, tail_hold
 
 
 def algorithm_delay_seconds(output_latency, block_time, crossfade_length, extra_time_right):

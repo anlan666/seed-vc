@@ -29,8 +29,10 @@ try:
         reference_browse_folder,
         settings_from_values,
         stop_audio_stream,
+        update_vad_playback,
         validate_extra_context,
         validate_reference_path,
+        wav2vec2_right_pad,
         with_sr_flags,
         parse_bool,
         cuda_target_for_gpu,
@@ -42,6 +44,9 @@ except ImportError:
         "请把 realtime_gui_zh_logic.py 与 real-time-gui-zh.py 放在同一目录。\n"
     )
     raise
+
+# Shown in the window title so a new zip is not confused with the build already installed.
+GUI_VERSION = "1.1"
 
 # Bound in main() after the original module sets the Mac MPS environment.
 engine = None
@@ -189,7 +194,13 @@ def build_layout(data, family, hostapis=None, input_devices=None, output_devices
 
     layout = [
         [
-            sg.Text("Seed-VC 实时变声", font=title_font, text_color=ACCENT, pad=((4, 12), (2, 2))),
+            sg.Text(
+                f"Seed-VC 实时变声 {GUI_VERSION}",
+                key="app_title",
+                font=title_font,
+                text_color=ACCENT,
+                pad=((4, 12), (2, 2)),
+            ),
             sg.Text("就绪", key="status", font=(family, 13), text_color="#FFFFFF", background_color=STATUS_COLOR["就绪"], pad=((10, 10), (4, 4))),
         ],
         [_hint(family, "原英文界面 real-time-gui.py 仍可使用。本窗口使用同一套实时引擎和同一份配置。")],
@@ -346,6 +357,10 @@ class GUI:
         self.model_ready = False
         self.device_error = None
         self._model_ms = None
+        self._ui_infer_ms = None
+        self._ui_model_ms = None
+        self._audio_status = ""
+        self.vad_tail_hold = 0
         self.font_family = "TkDefaultFont"
         try:
             self.update_devices()
@@ -440,7 +455,7 @@ class GUI:
         apply_theme()
         sg.set_options(font=(self.font_family, 13), element_padding=(6, 3))
         self.window = sg.Window(
-            "Seed-VC 实时变声",
+            f"Seed-VC 实时变声 {GUI_VERSION}",
             build_layout(
                 data,
                 self.font_family,
@@ -502,11 +517,14 @@ class GUI:
         global flag_vc
         try:
             while True:
-                # Blocking read, same as the original. A timeout event would hit
-                # the catch-all stop rule, so timeout is intentionally unused.
-                event, values = self.window.read()
+                # Timeout only flushes timing labels. decide_event("__TIMEOUT__")
+                # is "tick" and does not stop the stream.
+                event, values = self.window.read(timeout=200)
                 action = decide_event(event, flag_vc)
                 try:
+                    if action == "tick":
+                        self._flush_timing_labels()
+                        continue
                     if action == "close":
                         self.stop_stream()
                         break
@@ -554,6 +572,19 @@ class GUI:
                 self.window.close()
             except Exception:
                 pass
+
+    def _flush_timing_labels(self):
+        """Apply callback timings on the GUI thread. The audio thread must not call Tk."""
+        if self._ui_infer_ms is None:
+            return
+        try:
+            self.window["infer_time"].update(self._ui_infer_ms)
+            if self._ui_model_ms is None:
+                self.window["model_time"].update("—")
+            else:
+                self.window["model_time"].update(self._ui_model_ms)
+        except Exception:
+            pass
 
     def _reload_devices(self, values):
         self.gui_config.sg_hostapi = values.get("sg_hostapi", "")
@@ -755,7 +786,8 @@ class GUI:
         self.vad_cache = {}
         self.vad_chunk_size = min(500, 1000 * self.gui_config.block_time)
         self.vad_speech_detected = False
-        self.set_speech_detected_false_at_end_flag = False
+        self.vad_tail_hold = 0
+        self._audio_status = ""
         self.start_stream()
 
     def start_stream(self):
@@ -782,6 +814,16 @@ class GUI:
                 extra_settings=extra_settings,
             )
             self.stream.start()
+            try:
+                input_sr = sd.query_devices(device=sd.default.device[0])["default_samplerate"]
+                output_sr = sd.query_devices(device=sd.default.device[1])["default_samplerate"]
+                print(
+                    f"stream_samplerate: {self.gui_config.samplerate} "
+                    f"input_default_sr: {input_sr} output_default_sr: {output_sr} "
+                    f"block_frames: {self.block_frame}"
+                )
+            except Exception as exc:
+                print(f"stream_samplerate: {self.gui_config.samplerate} rate_query_failed: {exc}")
         except Exception:
             flag_vc = False
             self.stream, _closed = stop_audio_stream(self.stream)
@@ -793,8 +835,17 @@ class GUI:
         self.stream, _closed = stop_audio_stream(self.stream)
 
     def audio_callback(self, indata, outdata, frames, times, status):
-        """Same block processing as real-time-gui.py."""
+        """Same block processing as real-time-gui.py, with the tail gate fixed.
+
+        Tk is not updated here. PortAudio status is printed only when it changes,
+        because Infer time is measured before any GUI work and would hide a stall.
+        """
         global flag_vc
+        if status:
+            status_text = str(status)
+            if status_text and status_text != self._audio_status:
+                self._audio_status = status_text
+                print("audio_status:", status_text)
         print(indata.shape)
         start_time = time.perf_counter()
         self._model_ms = None
@@ -818,10 +869,9 @@ class GUI:
         )
         res_value = res[0]["value"]
         print(res_value)
-        if len(res_value) % 2 == 1 and not self.vad_speech_detected:
-            self.vad_speech_detected = True
-        elif len(res_value) % 2 == 1 and self.vad_speech_detected:
-            self.set_speech_detected_false_at_end_flag = True
+        audible, self.vad_speech_detected, self.vad_tail_hold = update_vad_playback(
+            res_value, self.vad_speech_detected, self.vad_tail_hold
+        )
         end_event.record()
         if engine.device.type == "mps":
             torch.mps.synchronize()
@@ -853,11 +903,15 @@ class GUI:
                 end_event = torch.cuda.Event(enable_timing=True)
                 torch.cuda.synchronize()
             start_event.record()
+            feature_wav = self.input_wav_res
+            right_pad = wav2vec2_right_pad(int(feature_wav.shape[0]))
+            if right_pad:
+                feature_wav = F.pad(feature_wav, (0, right_pad))
             infer_wav = engine.custom_infer(
                 self.model_set,
                 self.reference_wav,
                 self.gui_config.reference_audio_path,
-                self.input_wav_res,
+                feature_wav,
                 self.block_frame_16k,
                 self.skip_head,
                 self.skip_tail,
@@ -877,7 +931,7 @@ class GUI:
             elapsed_time_ms = start_event.elapsed_time(end_event)
             self._model_ms = elapsed_time_ms
             print(f"Time taken for VC: {elapsed_time_ms}ms")
-            if not self.vad_speech_detected:
+            if not audible:
                 infer_wav = torch.zeros_like(self.input_wav[self.extra_frame :])
         elif self.gui_config.I_noise_reduce:
             infer_wav = self.input_wav_denoise[self.extra_frame :].clone()
@@ -914,17 +968,8 @@ class GUI:
 
         total_time = time.perf_counter() - start_time
         if flag_vc:
-            try:
-                self.window["infer_time"].update(int(total_time * 1000))
-                if self._model_ms is None:
-                    self.window["model_time"].update("—")
-                else:
-                    self.window["model_time"].update(int(self._model_ms))
-            except Exception:
-                pass
-        if self.set_speech_detected_false_at_end_flag:
-            self.vad_speech_detected = False
-            self.set_speech_detected_false_at_end_flag = False
+            self._ui_infer_ms = int(total_time * 1000)
+            self._ui_model_ms = None if self._model_ms is None else int(self._model_ms)
         print(f"Infer time: {total_time:.2f}")
 
     def update_devices(self, hostapi_name=None):
