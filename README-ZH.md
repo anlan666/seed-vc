@@ -87,7 +87,13 @@ python app.py
 python real-time-gui.py --checkpoint-path <path-to-checkpoint> --config-path <path-to-config>
 ```
 - `checkpoint` 模型检查点路径，若为空将自动下载默认模型 (`seed-uvit-tat-xlsr-tiny`)
-- `config` 模型配置文件路径，若为空将自动下载默认配置  
+- `config` 模型配置文件路径，若为空将自动下载默认配置
+
+简体中文界面使用同一套参数和同一份 `configs/inuse/config.json`。原英文界面保留不动：
+```bash
+python real-time-gui-zh.py --checkpoint-path <path-to-checkpoint> --config-path <path-to-config>
+```
+安装、回滚和界面说明见 [docs/zh-gui/安装与回滚.md](docs/zh-gui/安装与回滚.md)。  
 
 重要提示: 强烈建议使用 GPU 进行实时语音转换。 在 NVIDIA RTX 3060 笔记本 GPU 上进行了一些性能测试，结果和推荐参数设置如下：
 
